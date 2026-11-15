@@ -1,0 +1,454 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Crear proyecto Android
+        run: |
+          mkdir -p app
+          cat > app/build.gradle <<'EOF_0'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.datoswidget.app'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.datoswidget.app'
+                  minSdk 29
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF_0
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_1'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" />
+
+              <application
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="Datos Widget"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <receiver
+                      android:name=".DataWidget"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.appwidget.provider"
+                          android:resource="@xml/widget_info" />
+                  </receiver>
+
+              </application>
+          </manifest>
+          EOF_1
+          mkdir -p app/src/main/java/com/datoswidget/app
+          cat > app/src/main/java/com/datoswidget/app/DataWidget.java <<'EOF_2'
+          package com.datoswidget.app;
+
+          import android.app.AppOpsManager;
+          import android.app.PendingIntent;
+          import android.app.usage.NetworkStats;
+          import android.app.usage.NetworkStatsManager;
+          import android.appwidget.AppWidgetManager;
+          import android.appwidget.AppWidgetProvider;
+          import android.content.ComponentName;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.graphics.Bitmap;
+          import android.graphics.BlurMaskFilter;
+          import android.graphics.Canvas;
+          import android.graphics.Matrix;
+          import android.graphics.Paint;
+          import android.graphics.RectF;
+          import android.graphics.SweepGradient;
+          import android.net.ConnectivityManager;
+          import android.os.Process;
+          import android.text.SpannableString;
+          import android.text.Spanned;
+          import android.text.style.RelativeSizeSpan;
+          import android.widget.RemoteViews;
+
+          import java.util.Calendar;
+          import java.util.Locale;
+
+          public class DataWidget extends AppWidgetProvider {
+
+              static final String ACTION_REFRESH = "com.datoswidget.app.REFRESH";
+              static final long DAY = 24L * 60L * 60L * 1000L;
+
+              @Override
+              public void onUpdate(Context c, AppWidgetManager m, int[] ids) {
+                  m.updateAppWidget(ids, build(c));
+              }
+
+              @Override
+              public void onReceive(Context c, Intent i) {
+                  super.onReceive(c, i);
+                  if (ACTION_REFRESH.equals(i.getAction())) {
+                      refreshAll(c);
+                  }
+              }
+
+              static void refreshAll(Context c) {
+                  AppWidgetManager m = AppWidgetManager.getInstance(c);
+                  int[] ids = m.getAppWidgetIds(new ComponentName(c, DataWidget.class));
+                  if (ids.length > 0) {
+                      m.updateAppWidget(ids, build(c));
+                  }
+              }
+
+              static boolean hasUsageAccess(Context c) {
+                  AppOpsManager a = (AppOpsManager) c.getSystemService(Context.APP_OPS_SERVICE);
+                  int mode = a.unsafeCheckOpNoThrow(
+                          AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), c.getPackageName());
+                  return mode == AppOpsManager.MODE_ALLOWED;
+              }
+
+              static double usedBytes(Context c, long from, long to) {
+                  try {
+                      NetworkStatsManager n =
+                              (NetworkStatsManager) c.getSystemService(Context.NETWORK_STATS_SERVICE);
+                      NetworkStats.Bucket b =
+                              n.querySummaryForDevice(ConnectivityManager.TYPE_MOBILE, null, from, to);
+                      return (double) b.getRxBytes() + (double) b.getTxBytes();
+                  } catch (Exception e) {
+                      return 0;
+                  }
+              }
+
+              static String fmt(double bytes) {
+                  if (bytes >= 1e9) {
+                      return String.format(Locale.US, "%.2f GB", bytes / 1e9);
+                  }
+                  return String.format(Locale.US, "%d MB", Math.round(bytes / 1e6));
+              }
+
+              static CharSequence big(double bytes) {
+                  String s = fmt(bytes);
+                  int sp = s.indexOf(' ');
+                  SpannableString ss = new SpannableString(s);
+                  ss.setSpan(new RelativeSizeSpan(0.55f), sp, s.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                  return ss;
+              }
+
+              static Bitmap ring(float frac) {
+                  int s = 360;
+                  float c = s / 2f;
+                  float stroke = 28f;
+                  float pad = 44f;
+                  Bitmap bmp = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888);
+                  Canvas cv = new Canvas(bmp);
+                  RectF r = new RectF(pad, pad, s - pad, s - pad);
+
+                  Paint track = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  track.setStyle(Paint.Style.STROKE);
+                  track.setStrokeWidth(stroke);
+                  track.setColor(0x3340C8FF);
+                  cv.drawOval(r, track);
+
+                  if (frac > 0.004f) {
+                      if (frac > 0.999f) {
+                          frac = 0.999f;
+                      }
+                      float sweep = 360f * frac;
+                      int[] cols = {0xFF00F0FF, 0xFF3D9BFF, 0xFF3D9BFF};
+                      float[] pos = {0f, frac, 1f};
+                      SweepGradient g = new SweepGradient(c, c, cols, pos);
+                      Matrix mx = new Matrix();
+                      mx.setRotate(-90f, c, c);
+                      g.setLocalMatrix(mx);
+
+                      Paint glow = new Paint(Paint.ANTI_ALIAS_FLAG);
+                      glow.setStyle(Paint.Style.STROKE);
+                      glow.setStrokeWidth(stroke + 8f);
+                      glow.setStrokeCap(Paint.Cap.ROUND);
+                      glow.setShader(g);
+                      glow.setAlpha(170);
+                      glow.setMaskFilter(new BlurMaskFilter(20f, BlurMaskFilter.Blur.NORMAL));
+                      cv.drawArc(r, -90f, sweep, false, glow);
+
+                      Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                      p.setStyle(Paint.Style.STROKE);
+                      p.setStrokeWidth(stroke);
+                      p.setStrokeCap(Paint.Cap.ROUND);
+                      p.setShader(g);
+                      cv.drawArc(r, -90f, sweep, false, p);
+                  }
+                  return bmp;
+              }
+
+              static RemoteViews build(Context c) {
+                  RemoteViews v = new RemoteViews(c.getPackageName(), R.layout.widget);
+                  SharedPreferences p = c.getSharedPreferences("plan", Context.MODE_PRIVATE);
+
+                  int fl = PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT;
+                  PendingIntent open = PendingIntent.getActivity(
+                          c, 1, new Intent(c, MainActivity.class), fl);
+                  PendingIntent refresh = PendingIntent.getBroadcast(
+                          c, 2, new Intent(c, DataWidget.class).setAction(ACTION_REFRESH), fl);
+                  v.setOnClickPendingIntent(R.id.gear, open);
+
+                  boolean ok = p.contains("start") && hasUsageAccess(c);
+                  if (!ok) {
+                      v.setOnClickPendingIntent(R.id.root, open);
+                      v.setImageViewBitmap(R.id.ring, ring(0f));
+                      v.setTextViewText(R.id.lbl, "CONFIGURAR");
+                      v.setTextViewText(R.id.big, "Toca");
+                      v.setTextViewText(R.id.sub, "para empezar");
+                      v.setTextViewText(R.id.chip_saldo, "$0.00");
+                      v.setTextViewText(R.id.chip_days, "-- d铆as");
+                      v.setTextViewText(R.id.val_used, "--");
+                      v.setTextViewText(R.id.val_today, "--");
+                      v.setProgressBar(R.id.bar_used, 100, 0, false);
+                      v.setProgressBar(R.id.bar_today, 100, 0, false);
+                      return v;
+                  }
+                  v.setOnClickPendingIntent(R.id.root, refresh);
+
+                  double total = p.getFloat("total", 0f) * 1e9;
+                  double left0 = p.getFloat("left", 0f) * 1e9;
+                  int days = p.getInt("days", 1);
+                  float saldo = p.getFloat("saldo", 0f);
+                  long start = p.getLong("start", System.currentTimeMillis());
+                  long now = System.currentTimeMillis();
+
+                  double left = left0 - usedBytes(c, start, now);
+                  if (left < 0) {
+                      left = 0;
+                  }
+                  double frac = total > 0 ? left / total : 0;
+                  if (frac > 1) {
+                      frac = 1;
+                  }
+                  double used = total - left;
+                  if (used < 0) {
+                      used = 0;
+                  }
+                  int usedPct = total > 0 ? (int) Math.round(used / total * 100) : 0;
+
+                  long end = start + days * DAY;
+                  int daysLeft = (int) Math.ceil((end - now) / (double) DAY);
+                  if (daysLeft < 0) {
+                      daysLeft = 0;
+                  }
+
+                  Calendar cal = Calendar.getInstance();
+                  cal.set(Calendar.HOUR_OF_DAY, 0);
+                  cal.set(Calendar.MINUTE, 0);
+                  cal.set(Calendar.SECOND, 0);
+                  cal.set(Calendar.MILLISECOND, 0);
+                  double today = usedBytes(c, cal.getTimeInMillis(), now);
+                  double pace = left0 / Math.max(1, days);
+                  int todayPct = pace > 0 ? (int) Math.min(100, Math.round(today / pace * 100)) : 0;
+
+                  v.setImageViewBitmap(R.id.ring, ring((float) frac));
+                  v.setTextViewText(R.id.lbl, "LIBRES");
+                  v.setTextViewText(R.id.big, big(left));
+                  v.setTextViewText(R.id.sub, "de " + fmt(total));
+                  v.setTextViewText(R.id.chip_saldo, String.format(Locale.US, "$%.2f", saldo));
+                  v.setTextViewText(R.id.chip_days, daysLeft == 1 ? "1 d铆a" : daysLeft + " d铆as");
+                  v.setTextViewText(R.id.val_used, fmt(used));
+                  v.setTextViewText(R.id.val_today, fmt(today));
+                  v.setProgressBar(R.id.bar_used, 100, usedPct, false);
+                  v.setProgressBar(R.id.bar_today, 100, todayPct, false);
+                  return v;
+              }
+          }
+          EOF_2
+          mkdir -p app/src/main/java/com/datoswidget/app
+          cat > app/src/main/java/com/datoswidget/app/MainActivity.java <<'EOF_3'
+          package com.datoswidget.app;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.graphics.Color;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.text.InputType;
+          import android.view.ViewGroup;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          public class MainActivity extends Activity {
+
+              EditText fTotal, fLeft, fDays, fSaldo;
+              TextView perm;
+
+              int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density);
+              }
+
+              TextView label(LinearLayout root, String s, int sp, int color, boolean bold, int topDp) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(sp);
+                  t.setTextColor(color);
+                  if (bold) {
+                      t.setTypeface(t.getTypeface(), android.graphics.Typeface.BOLD);
+                  }
+                  t.setPadding(0, dp(topDp), 0, 0);
+                  root.addView(t);
+                  return t;
+              }
+
+              EditText field(LinearLayout root, String hint, String init, boolean decimal) {
+                  EditText e = new EditText(this);
+                  e.setHint(hint);
+                  e.setText(init);
+                  e.setInputType(decimal
+                          ? (InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL)
+                          : InputType.TYPE_CLASS_NUMBER);
+                  e.setTextColor(Color.WHITE);
+                  e.setHintTextColor(0x88FFFFFF);
+                  root.addView(e, new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                  return e;
+              }
+
+              float num(EditText e) {
+                  return Float.parseFloat(e.getText().toString().trim().replace(',', '.'));
+              }
+
+              String show(SharedPreferences p, String key) {
+                  return p.contains(key) ? String.valueOf(p.getFloat(key, 0f)) : "";
+              }
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  final SharedPreferences p = getSharedPreferences("plan", MODE_PRIVATE);
+
+                  ScrollView sv = new ScrollView(this);
+                  sv.setBackgroundColor(0xFF0A1628);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(dp(24), dp(56), dp(24), dp(32));
+                  sv.addView(root);
+
+                  label(root, "Datos Widget", 26, 0xFF00F0FF, true, 0);
+                  label(root, "Escribe lo que dice tu paquete en este momento. "
+                          + "Cada vez que recargues, o quieras recalibrar, vuelve a guardar.",
+                          14, 0xFFC8D8E8, false, 8);
+
+                  label(root, "Paquete total (GB)", 13, 0xFF9FB4C8, false, 20);
+                  fTotal = field(root, "ej. 9.49", show(p, "total"), true);
+                  label(root, "Te quedan ahora (GB)", 13, 0xFF9FB4C8, false, 12);
+                  fLeft = field(root, "ej. 5.54", show(p, "left"), true);
+                  label(root, "D铆as que te quedan", 13, 0xFF9FB4C8, false, 12);
+                  fDays = field(root, "ej. 15", p.contains("days") ? String.valueOf(p.getInt("days", 0)) : "", false);
+                  label(root, "Saldo ($, lo escribes t煤)", 13, 0xFF9FB4C8, false, 12);
+                  fSaldo = field(root, "ej. 0.00", show(p, "saldo"), true);
+
+                  Button save = new Button(this);
+                  save.setText("Guardar y actualizar widget");
+                  save.setOnClickListener(x -> {
+                      try {
+                          float t = num(fTotal);
+                          float l = num(fLeft);
+                          int d = Math.round(num(fDays));
+                          float s = fSaldo.getText().toString().trim().isEmpty() ? 0f : num(fSaldo);
+                          if (t <= 0 || l < 0 || d <= 0) {
+                              throw new NumberFormatException();
+                          }
+                          p.edit()
+                                  .putFloat("total", t)
+                                  .putFloat("left", l)
+                                  .putInt("days", d)
+                                  .putFloat("saldo", s)
+                                  .putLong("start", System.currentTimeMillis())
+                                  .apply();
+                          DataWidget.refreshAll(this);
+                          Toast.makeText(this, "Listo, widget actualizado", Toast.LENGTH_SHORT).show();
+                      } catch (NumberFormatException e) {
+                          Toast.makeText(this, "Revisa los n煤meros", Toast.LENGTH_SHORT).show();
+                      }
+                  });
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  lp.topMargin = dp(20);
+                  root.addView(save, lp);
+
+                  perm = label(root, "", 14, 0xFF00F0FF, true, 28);
+                  Button access = new Button(this);
+                  access.setText("Dar permiso de uso de datos");
+                  access.setOnClickListener(x ->
+                          startActivity(new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)));
+                  root.addView(access, lp);
+
+                  label(root, "Despu茅s: deja presionado un espacio vac铆o del inicio, entra a Widgets "
+                          + "y busca Datos Widget. El widget se actualiza solo cada cierto tiempo; "
+                          + "t贸calo para actualizarlo al momento.",
+                          13, 0xFF9FB4C8, false, 24);
+
+                  setContentView(sv);
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  boolean ok = DataWidget.hasUsageAccess(this);
+                  perm.setText(ok ? "Permiso de uso de datos: activado"
+                          : "Falta el permiso de uso de datos");
+                  perm.setTextColor(ok ? 0xFF00F0FF : 0xFFFF6B6B);
+                  DataWidget.refreshAll(this);
+              }
+          }
+          EOF_3
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/bar.xml <<'EOF_4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+              <item android:id="@android:id/background">
+                  <shape android:shape="rectangle">
+                      <solid android:color="#26FFFFFF" />
+                      <corners android:radius="3dp" />
+                  </shape>
